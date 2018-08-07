@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+import socket
+import struct
+import select
+import json
+
+import regex
+
+import DynModule
+import JimoAPI.connector
+import JimoAPI.tf
+
+default_port = 12245
+
+
+class JimoParser():
+    def host(self, ip='', port=default_port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.bind((ip, port))
+        self.socket.listen(1)
+        print('Waiting for connection...')
+        self.conn, self.addr = self.socket.accept()
+        print('Connected by: {}'.format(self.addr))
+
+    def listen(self):
+        while True:
+            read, write, err = select.select([self.conn], [], [], 60)
+            if len(read) is not 0:
+                length = self.conn.recv(4)
+                if len(length) is 0:
+                    self.conn.shutdown(2)
+                    self.conn.close()
+                    print('Disconnected by: {}'.format(self.addr))
+                    self.conn, self.addr = self.socket.accept()
+                    print('Connected by: {}'.format(self.addr))
+                    continue
+                length = struct.unpack('>i', length)[0]
+                data = bytearray()
+                while len(data) < length:
+                    data += self.conn.recv(2048)
+                result, flag = self.parse(JimoAPI.core.decode_bytes(data))
+                result = result.encode('utf8')
+                self.conn.sendall(struct.pack('>i', len(result) + 1) + struct.pack('?', flag) + result)
+
+    def parse_head(self, msg):
+        expression = msg
+        args = []
+        kwargs = {}
+        try:
+            body = regex.compile(r'([^\(]*)\s*(?:\(((?:.|\s)*)\)\s*)?;', regex.MULTILINE).match(expression).groups()
+        except AttributeError:
+            return (None, None, None, 'invalid expression, expression: {}'.format(expression), False)
+        match = None
+        for module_name in DynModule.module_list:
+            match = regex.compile(module_name, regex.IGNORECASE).match(body[0])
+            if match is not None:
+                match = (module_name, match)
+                break
+        if match is not None:
+            for name, val in zip(DynModule.module_list[match[0]]['param_name'], match[1].groups()):
+                if name:
+                    kwargs[name] = val
+                else:
+                    args.append(val)
+        else:
+            return None, None, None, 'No match', False
+        return args, kwargs, match[0], body[1], True
+
+    def parse(self, msg):
+        args, kwargs, module_name, body, flag = self.parse_head(msg)
+        if not flag:
+            return body, True
+        if body:
+            param = regex.compile("""\\s*(\\w+)\\s*(?::\\s*(\\w+|"""
+                                  """(?:\\((?:".*?(?<!\\\\)(?:\\\\\\\\)*?"|"""
+                                  """'.*?(?<!\\\\)(?:\\\\\\\\)*?'|[^()]|"""
+                                  """(?2))*\\)|"""
+                                  """\\[(?:".*?(?<!\\\\)(?:\\\\\\\\)*?"|"""
+                                  """'.*?(?<!\\\\)(?:\\\\\\\\)*?'|"""
+                                  """[^[\\]]|(?2))*\\]|"""
+                                  """{(?:".*?(?<!\\\\)(?:\\\\\\\\)*?"|"""
+                                  """'.*?(?<!\\\\)(?:\\\\\\\\)*?'|"""
+                                  """[^{}]|(?2))*}|"""
+                                  """(?:".*?(?<!\\\\)(?:\\\\\\\\)*?"|"""
+                                  """'.*?(?<!\\\\)(?:\\\\\\\\)*?')))\\s*)?"""
+                                  ).finditer(body)
+            for match in param:
+                if match.group(2) is None:
+                    args.append(match.group(1))
+                else:
+                    json_fix = regex.sub(r"""([{,]\s*(?<!"))(\w+)(\s*:)""",
+                                         r'\1"\2"\3', match.group(2))
+                    try:
+                        json_fix = json.loads(json_fix)
+                    except json.decoder.JSONDecodeError as e:
+                        if (json_fix[0] == '(' or
+                                json_fix[0] == '[' or json_fix[0] == '{'):
+                            print('Possible json have not '
+                                  'been parsed, error: {}'.format(repr(e)))
+                        elif (json_fix[0] == "'"):
+                            json_fix = json_fix[1:-1]
+                    kwargs[match.group(1)] = json_fix
+        return DynModule.execute(module_name, *args, **kwargs), True
+
+
+if __name__ == '__main__':
+    parser = JimoParser()
+    parser.host()
+    parser.listen()
